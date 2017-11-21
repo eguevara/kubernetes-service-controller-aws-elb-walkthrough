@@ -122,7 +122,9 @@ At this point, kubernetes has all of the initial aws configs needed to build an 
 ## Building the AWS Provider
 #### How does the Kubernetes talk to AWS?
 
-Lets first look at the kube-apiserver logs to see if there is anything that can indicate any cloud provider movement. *Picking to start with the kube-apiserver since the kubectl client goes through the api server to store its resources.*
+Lets first look at the kube-apiserver logs to see if there is anything that can indicate any cloud provider movement. 
+
+_Note:_  Picking to start with the kube-apiserver since the kubectl client goes through the api server to store its resources.  *I later discover, as you'll see below that this is the wrong path ;)*
 
 You can view the kube-apiserver logs by running
 ```bash
@@ -164,18 +166,21 @@ Following the `providers` package then leads to yet another blank identifer for 
 _ "k8s.io/kubernetes/pkg/cloudprovider/providers/aws"
 ```
 
-And there you have it, importing this aws package from [aws.go](https://github.com/kubernetes/kubernetes/blob/bebdeb749f1fa3da9e1312c4b08e439c404b3136/pkg/cloudprovider/providers/aws/aws.go) then calls the `func init()` on load which [registers](https://github.com/kubernetes/kubernetes/blob/bebdeb749f1fa3da9e1312c4b08e439c404b3136/pkg/cloudprovider/plugins.go#L44) the `newAWSCloud` instance to memory by its `cloud-provider` (aws).  So when the kube-apiserver needs a cloud context, it does a map lookup on the `cloud-provider` to its registry and gets the concrete implementation of the cloud provider interface.
+And there you have it, importing this aws package from [aws.go](https://github.com/kubernetes/kubernetes/blob/bebdeb749f1fa3da9e1312c4b08e439c404b3136/pkg/cloudprovider/providers/aws/aws.go) then calls the `func init()` on load which [registers](https://github.com/kubernetes/kubernetes/blob/bebdeb749f1fa3da9e1312c4b08e439c404b3136/pkg/cloudprovider/plugins.go#L44) the `newAWSCloud` instance to memory by its `cloud-provider` (aws).  So when the kube-apiserver needs a cloud context, it does a map lookup on the `cloud-provider` to its registry and gets the concrete implementation of the cloud provider interface. Something to keep in mind is that all of this cloud provider set up happens before we actually run the kub-apiserver `main()` function.  
+
+So.. at this point, the kube-apiserver is now able to build a aws provider given the aws configs from `cloud-configs` flag. It stores all of the cloud providers in its registry and it's ready for the kube-apiserver code to use when needed.  
+
 
 cool!!  
 
-At this point now, the kube-apiserver is now able to build a aws provider given the aws configs from `cloud-configs` flag, but this still does not tie in the aws load balancer code.. hmmm. 
+Aaaannd... here is the point where I found myself in a dead end, not being able to tie in the kube-apiserver command to any of the load balancer code from the aws provider... hmmm. 
 
-Seems like the kube-apiserver is a dead end for my purpose...
-#### So then.. what actually listens to and reacts to a change in a service resource?
+Seems like the kube-apiserver was the wrong path for my purpose of figuring out how elbs are created as part of a new service resource.
+#### So then.. what actually calls the code that updates the aws load balancers?
 
 ## Controllers
 
-So what I realized at this point is that creating the actual `kind:Service` resource does not actually create the elb.  This just writes to the api server and stores the manifest information to its datastore (etcd).  Once the resource has be stored and made available to the kube-apiserver a *controller* reacts and attempts to reconcile a desired state.
+So what I realized then is that creating the actual `kind:Service` resource does not actually create the elb.  This just writes to the api server and stores the manifest information to its datastore (etcd).  Once the resource has be stored and made available to the kube-apiserver a *controller* reacts and attempts to reconcile a desired state.
 
 ### Wait what? What the hell is a controller?
 A [kubernetes controller](https://kubernetes.io/docs/reference/generated/kube-controller-manager/) will watch a resource and implement the behavior (code)
@@ -229,6 +234,7 @@ Inspecting the output we can find the start command used and the mounts used.
 --cloud-provider=aws 
 --cluster-name=k8-dev.dev.cloud.motorola.net 
 --v=2 
+--kubeconfig=/var/lib/kube-controller-manager/kubeconfig 
 --cloud-config=/etc/kubernetes/cloud.config 
  1>>/var/log/kube-controller-manager.log 2>&1
 ...
@@ -246,7 +252,33 @@ Lets look at the main() now.
 
 [controller-manager.go](https://github.com/kubernetes/kubernetes/blob/v1.7.10/cmd/kube-controller-manager/controller-manager.go) starts in main() by creating a new cm server() which sets up default configs.  Then, it reads the flags passed into the binary and sets them as options. These are the arguments passed into the kube-controller-manager binary (--cloud-provider, --cluster, --cloud-config) from above. 
 
-Once its has the flags, logs and metrics set up, it calls `app.Run(s)` to *run* the controller-manager server.
+Once its has the flags, logs and metrics set up, it calls `app.Run(s)` to *run* the controller manager server. Here the code begins by validating the KnownControllers, setting up the kube configs to talk to master by reading from the `--kubeconfig` flag and creates a [http server](https://github.com/kubernetes/kubernetes/blob/bebdeb749f1fa3da9e1312c4b08e439c404b3136/cmd/kube-controller-manager/app/controllermanager.go#L152) debuging/metrics.
+
+At this point you should be able to validate the handler endpoints like /metrics for example which is used by prometheus scraping.
+```bash
+wget -S -q localhost:10252/metrics
+  HTTP/1.1 200 OK
+  Content-Length: 43944
+  Content-Type: text/plain; version=0.0.4
+  Date: Tue, 21 Nov 2017 19:50:42 GMT
+  Connection: close
+```
+
+Then it locks the kube-controller-manager using the LeaderElection resource type so that it can elect a leader.  Once it has a leader, it spawns the [run](https://github.com/kubernetes/kubernetes/blob/bebdeb749f1fa3da9e1312c4b08e439c404b3136/cmd/kube-controller-manager/app/controllermanager.go#L160) goroutine to iterate and *start* each built-in controller.
+
+Looking at the `run` goroutine, [CreateControllerContext](https://github.com/kubernetes/kubernetes/blob/bebdeb749f1fa3da9e1312c4b08e439c404b3136/cmd/kube-controller-manager/app/controllermanager.go#L175) will create the cloud context based on the `--cloud-provider` flag to do a map lookup on the registered cloud providers initialized earlier.  The controller context, along with its cloud provider instance ([ctx.Cloud](https://github.com/kubernetes/kubernetes/blob/bebdeb749f1fa3da9e1312c4b08e439c404b3136/cmd/kube-controller-manager/app/controllermanager.go#L411)),  is then used to start the list of controllers. 
+
+[StartControllers](https://github.com/kubernetes/kubernetes/blob/bebdeb749f1fa3da9e1312c4b08e439c404b3136/cmd/kube-controller-manager/app/controllermanager.go#L181) takes in as a parameter a map of controllers to process.  Looking at the [NewControllerInitializers()](https://github.com/kubernetes/kubernetes/blob/bebdeb749f1fa3da9e1312c4b08e439c404b3136/cmd/kube-controller-manager/app/controllermanager.go#L307), we see the list of controllers to start and listed is `controllers["service"] = startServiceController`. Bingo!
+
+_Note:_ The `controllers["service"]` value is of type `InitFunc` which takes in as a parameter a ControllerContext and returns (bool,error) 
+
+So now the StartControllers function iterates through controllers map calling each value of each key.  When it gets to the `"service"` key, since the value is of type func, calling `initFun(ctx)` is like calling `startServiceController(ctx ControllerContext)` from [core.go](https://github.com/kubernetes/kubernetes/blob/v1.7.10/cmd/kube-controller-manager/app/core.go)
+
+The startServiceController function creates a New serviceController instance and finally calls `serviceController.Run` as a goroutine.
+
+Bam!  We've fully traced how a controller manager is started, how it builds its cloud providers, how it iterates through its built-in controllers and finally how it starts with `run` each controller.  This circles us back to the kube-controller-manager log we started with where the service controller continues to set up the watch to handle deletes, creates or adding back to the queue.
+
+Now lets deep dive into the aws logic...
 
 ## Tips
 #### What are some of things that helped trace through the code?
@@ -259,3 +291,7 @@ Success: Tests passed.
 ```
 
 - Take a look at the CloudTrail event history from the AWS console.  With CloudTrail, you can filter by the userName and use the master node which is running the kube-apiserver to filter the results (i-035be74d9d4f68).  This gives you a sequential list of the apis called by the kubernetes code to configure the AWS elb.  For example, you can see events like CreateSecurityGroup, ModifyLoadBalancerAttributes, CreateLoadBalancer and AuthorizeSecurityGroupIngress.  This helped out identifying what apis were called from the code.
+- You can use kubectl edit to look at the kube-controller-manager and kube-apiserver manifest files to inspect what flags are set and mounts will be created. 
+```bash
+k edit -n kube-system pod kube-apiserver-ip-100-68-14-xxx.us-west-2.compute.internal 
+```
