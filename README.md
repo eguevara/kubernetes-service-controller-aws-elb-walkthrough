@@ -120,9 +120,9 @@ k describe pod kube-apiserver-ip-100-68-14-xxx.us-west-2.compute.internal -n kub
 At this point, kubernetes has all of the initial aws configs needed to build an aws cloud provider.
 
 ## Building the AWS Provider
-#### How does the kubernetes build the AWS cloud provider?
+#### How does the Kubernetes talk to AWS?
 
-Lets first look at the kube-apiserver logs to see if there is anything that can indicate any cloud provider movement.  
+Lets first look at the kube-apiserver logs to see if there is anything that can indicate any cloud provider movement. *Picking to start with the kube-apiserver since the kubectl client goes through the api server to store its resources.*
 
 You can view the kube-apiserver logs by running
 ```bash
@@ -164,17 +164,18 @@ Following the `providers` package then leads to yet another blank identifer for 
 _ "k8s.io/kubernetes/pkg/cloudprovider/providers/aws"
 ```
 
-And there you have it, importing this aws package from [aws.go](https://github.com/kubernetes/kubernetes/blob/bebdeb749f1fa3da9e1312c4b08e439c404b3136/pkg/cloudprovider/providers/aws/aws.go) then calls the `func init()` on load which ties it all together by returning `newAWSCloud` which is an implementation of the cloudprovider interface.
+And there you have it, importing this aws package from [aws.go](https://github.com/kubernetes/kubernetes/blob/bebdeb749f1fa3da9e1312c4b08e439c404b3136/pkg/cloudprovider/providers/aws/aws.go) then calls the `func init()` on load which [registers](https://github.com/kubernetes/kubernetes/blob/bebdeb749f1fa3da9e1312c4b08e439c404b3136/pkg/cloudprovider/plugins.go#L44) the `newAWSCloud` instance to memory by its `cloud-provider` (aws).  So when the kube-apiserver needs a cloud context, it does a map lookup on the `cloud-provider` to its registry and gets the concrete implementation of the cloud provider interface.
 
 cool!!  
 
-At this point now, the kube-apiserver is now able to build a aws provider given the aws configs from `cloud-configs` flag. 
+At this point now, the kube-apiserver is now able to build a aws provider given the aws configs from `cloud-configs` flag, but this still does not tie in the aws load balancer code.. hmmm. 
 
-#### So now... How does kubernetes watch/listen to when it needs to create an external load balancer on a service resource change?
+Seems like the kube-apiserver is a dead end for my purpose...
+#### So then.. what actually listens to and reacts to a change in a service resource?
 
 ## Controllers
 
-So what I realized at this point is that creating the actual `kind:Service` resource does not actually create the elb.  This just writes to the api server and stores the manifest information to its datastore (etcd).  Once the resource has be stored and made available to the kube-apiserver a controller reacts and attempts to reconcile a desired state.
+So what I realized at this point is that creating the actual `kind:Service` resource does not actually create the elb.  This just writes to the api server and stores the manifest information to its datastore (etcd).  Once the resource has be stored and made available to the kube-apiserver a *controller* reacts and attempts to reconcile a desired state.
 
 ### Wait what? What the hell is a controller?
 A [kubernetes controller](https://kubernetes.io/docs/reference/generated/kube-controller-manager/) will watch a resource and implement the behavior (code)
@@ -212,7 +213,40 @@ At this point, we've traced back how the serviceController is called by the mana
 
 #### How does the kube-controller-manager know about the serviceController? How does it know how many workers to kick off? How does it know cloud provider info to hand off to the controller to manage the elb?
 
+## Controller Manager
 
+As mentioned above, the manager is responsible for starting the built-in control loops. Similar to the kube-apiserver, we can take a look at how the kube-controller-manager is started and with which flags.
+
+
+```bash
+k describe pod kube-controller-manager-ip-100-68-14-xxx.us-west-2.compute.internal -n kube-system
+```
+
+Inspecting the output we can find the start command used and the mounts used.
+
+```bash
+/usr/local/bin/kube-controller-manager i
+--cloud-provider=aws 
+--cluster-name=k8-dev.dev.cloud.motorola.net 
+--v=2 
+--cloud-config=/etc/kubernetes/cloud.config 
+ 1>>/var/log/kube-controller-manager.log 2>&1
+...
+Mounts:
+      /etc/kubernetes/cloud.config
+```
+
+cool...
+
+Lets take a look at the kube-controller-manager command. 
+
+Before main() is even called, the `main` package handles its imports.  In particular, it imports the `k8s.io/kubernetes/cmd/kube-controller-manager/app` package.  The app does its import dance and gets to [plugins.go](https://github.com/kubernetes/kubernetes/blob/bebdeb749f1fa3da9e1312c4b08e439c404b3136/cmd/kube-controller-manager/app/plugins.go#L28) where it then imports the cloud providers package as a blank identifier. The `providers` package then loads all of the cloud providers available, again with [blank identifiers](https://github.com/kubernetes/kubernetes/blob/v1.7.10/pkg/cloudprovider/providers/providers.go).  Each package registers itself as part of their `init()` function when they are imported. At this point before main(), the `kube-controller-manager` already has in memory all of the cloud providers built, registered and ready for use.
+
+Lets look at the main() now.
+
+[controller-manager.go](https://github.com/kubernetes/kubernetes/blob/v1.7.10/cmd/kube-controller-manager/controller-manager.go) starts in main() by creating a new cm server() which sets up default configs.  Then, it reads the flags passed into the binary and sets them as options. These are the arguments passed into the kube-controller-manager binary (--cloud-provider, --cluster, --cloud-config) from above. 
+
+Once its has the flags, logs and metrics set up, it calls `app.Run(s)` to *run* the controller-manager server.
 
 ## Tips
 #### What are some of things that helped trace through the code?
